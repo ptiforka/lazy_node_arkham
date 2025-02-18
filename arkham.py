@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 import time
 import re
-import uuid
 import random
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Error as PlaywrightError
 
 COOKIE_FILE = "cookies.txt"
 
-# Proxy credentials extracted from your provided string:
-# http://USERNAME:PASSWORD@gate.nodemaven.com:8080
+# Proxy configuration (if needed)
 PROXY_SERVER = "http://gate.nodemaven.com:8080"
-PROXY_USERNAME = ""
-PROXY_PASSWORD = ""
 
-def random_delay():
-    """Sleep for a random interval between 0.5 and 3 seconds."""
-    delay = random.uniform(0.5, 3)
-    time.sleep(delay)
+ORDER_SELECTOR = '[data-testid="trade-tradeinfo-order-id-0"]'
+
+def random_delay(min_delay=0.5, max_delay=2):
+    time.sleep(random.uniform(min_delay, max_delay))
 
 def parse_balance(balance_str):
-    """Remove non-digit/decimal characters and convert to float."""
+    """Remove non-digit characters and convert to float."""
     clean_str = re.sub(r'[^\d\.]', '', balance_str)
     try:
         return float(clean_str)
-    except:
+    except Exception as e:
+        print("Error parsing balance:", e)
         return 0.0
 
 def get_balances(page):
     """
-    Dynamically detect which balance is SOL and which is USDT
-    by reading their labels. Returns (sol_balance, usdt_balance).
+    Reads wallet balances from the page. Returns (sol_balance, usdt_balance).
+    Adjusts based on the asset label.
     """
     asset0_name_sel = '[data-testid="trade-wallet-asset-name-0"]'
     asset1_name_sel = '[data-testid="trade-wallet-asset-name-1"]'
@@ -48,18 +45,16 @@ def get_balances(page):
     asset0_balance = parse_balance(asset0_balance_str)
     asset1_balance = parse_balance(asset1_balance_str)
 
-    # Decide which is SOL vs. USDT based on the name text
     if 'SOL' in asset0_name.upper():
         sol_balance = asset0_balance
         usdt_balance = asset1_balance
     else:
         sol_balance = asset1_balance
         usdt_balance = asset0_balance - 1
-
     return sol_balance, usdt_balance
 
 def move_mouse_to_element(page, selector):
-    """Simulate smooth mouse movement to the center of the element."""
+    """Smoothly move the mouse to the center of the element."""
     element_handle = page.wait_for_selector(selector)
     box = element_handle.bounding_box()
     if not box:
@@ -67,38 +62,202 @@ def move_mouse_to_element(page, selector):
         return
     target_x = box["x"] + box["width"] / 2
     target_y = box["y"] + box["height"] / 2
-
-    # For simplicity, assume the mouse starts at (0,0).
-    # We'll do ~20 small steps to simulate movement.
     steps = 20
     for i in range(1, steps + 1):
-        new_x = (target_x * i) / steps
-        new_y = (target_y * i) / steps
-        page.mouse.move(new_x, new_y)
+        page.mouse.move((target_x * i) / steps, (target_y * i) / steps)
         time.sleep(0.05)
 
 def click_element(page, selector):
-    """Move mouse to the element, wait a random delay, then click it."""
+    """Move to an element, wait a bit, then click it."""
     page.wait_for_selector(selector, timeout=5000)
     move_mouse_to_element(page, selector)
-    random_delay()
+    random_delay(0.5, 1.5)
     page.click(selector)
+    random_delay(0.5, 1.5)
+
+def cancel_order(page):
+    """Attempt to cancel the active order.
+    First try clicking normally; if that fails, force a click via JS.
+    """
+    cancel_button_selector = '.a480080.a99729a.ac07bd5.af77d85'
+    try:
+        cancel_locator = page.locator(cancel_button_selector).first
+        cancel_locator.wait_for(state="visible", timeout=5000)
+        cancel_locator.click()
+        random_delay()
+        print("Order cancelled normally.")
+    except Exception as e:
+        print("Error cancelling order normally:", e)
+        try:
+            print("Attempting force cancellation...")
+            page.evaluate(f"document.querySelector('{cancel_button_selector}').click()")
+            random_delay()
+            print("Order cancelled using force.")
+        except Exception as e2:
+            print("Force cancellation failed:", e2)
+
+def safe_query_selector(page, selector):
+    """Query for an element while catching errors due to navigation/context destruction."""
+    try:
+        return page.query_selector(selector)
+    except PlaywrightError as e:
+        print(f"Error querying selector {selector}: {e}")
+        return None
+
+# --- Price Fetching Functions ---
+def get_real_buy_price(page):
+    """
+    Fetch the real BUY price from the button with classes:
+    "pl-3 text-green-900 undefined"
+    """
+    try:
+        selector = "button.pl-3.text-green-900.undefined"
+        element = page.wait_for_selector(selector, timeout=5000)
+        price = (element.text_content() or "").strip()
+        print(f"Fetched real BUY price: {price}")
+        return price
+    except Exception as e:
+        print("Error fetching real BUY price:", e)
+        return None
+
+def compute_target_sell_price(page):
+    """
+    Compute the target SELL price by taking the real BUY price
+    and adding a random increment between 0.01 and 0.04.
+    """
+    buy_price = get_real_buy_price(page)
+    if not buy_price:
+        print("Could not fetch real BUY price for computing SELL price.")
+        return None
+    try:
+        buy_val = float(buy_price)
+    except Exception as e:
+        print("Error converting buy price to float:", e)
+        return None
+    increment = random.uniform(0.01, 0.04)
+    target_sell_val = round(buy_val + increment, 2)
+    target_sell_price = f"{target_sell_val:.2f}"
+    print(f"Computed SELL price: {target_sell_price} (Buy price: {buy_price} + increment: {increment:.2f})")
+    return target_sell_price
+
+# --- Trade Functions ---
+def trade_limit_buy_sol(page):
+    """
+    Place a limit BUY order using the real BUY price.
+    BEFORE entering the order, click the BUY tab.
+    After submission, perform up to 3 checks (5 sec each).
+    If the fetched real price differs from the order price at any check,
+    cancel the order and return False; otherwise, leave the order active.
+    Finally, click the BUY tab.
+    """
+    print("=== Initiating Limit BUY Order ===")
+    # Ensure BUY tab is active
+    click_element(page, '[data-testid="trade-orderform-buy-tab"]')
+    click_element(page, '[data-testid="trade-orderform-limit-tab"]')
+
+    real_price = get_real_buy_price(page)
+    if not real_price:
+        print("Could not fetch real BUY price; aborting order.")
+        return False
+    last_order_price = real_price
+    print(f"Using real BUY price: {last_order_price}")
+
+    limit_price_input_selector = '[data-testid="trade-orderform-limit-price-input"]'
+    page.wait_for_selector(limit_price_input_selector)
+    move_mouse_to_element(page, limit_price_input_selector)
+    random_delay()
+    page.fill(limit_price_input_selector, last_order_price)
     random_delay()
 
-def trade_sell_sol(page):
-    """
-    Sell a random 30–95% of the user's SOL balance (rounded to 3 decimals).
-    Fills `data-testid="trade-orderform-size-input"`.
-    Then clicks the Sell tab and Sell button.
-    """
     sol_balance, usdt_balance = get_balances(page)
-    print(f"Detected balances: SOL={sol_balance}, USDT={usdt_balance}")
+    print(f"Current balances - SOL: {sol_balance}, USDT: {usdt_balance}")
 
-    percent = random.uniform(0.30, 0.95)
-    trade_amount = round(sol_balance * percent, 3)
-    print(f"Selling {trade_amount} SOL ({percent*100:.1f}% of SOL)")
+    random_percent = random.uniform(0.60, 0.95)
+    deduction = random.uniform(1, 2)
+    available_for_trade = usdt_balance - deduction
+    if available_for_trade <= 0:
+        print("Not enough USDT after deduction.")
+        return False
+    trade_amount = round(available_for_trade * random_percent, 3)
+    print(f"Using {trade_amount} USDT for BUY order (percent: {random_percent:.2f}, deduction: {deduction:.2f}).")
 
-    # Fill the size input
+    notional_input_selector = '[data-testid="trade-orderform-notional-input"]'
+    page.wait_for_selector(notional_input_selector)
+    move_mouse_to_element(page, notional_input_selector)
+    random_delay()
+    page.fill(notional_input_selector, str(trade_amount))
+    random_delay()
+
+    # Re-read real price before submission
+    new_price = get_real_buy_price(page)
+    if new_price and new_price != last_order_price:
+        print(f"Real BUY price changed from {last_order_price} to {new_price} before submission. Updating.")
+        page.fill(limit_price_input_selector, new_price)
+        last_order_price = new_price
+        random_delay()
+
+    click_element(page, '[data-testid="trade-orderform-submit-button"]')
+
+    # Perform up to 3 checks (5 sec each)
+    check_count = 0
+    while check_count < 3:
+        time.sleep(5)
+        order_present = safe_query_selector(page, ORDER_SELECTOR)
+        if not order_present:
+            print("BUY order filled; no active order found.")
+            click_element(page, '[data-testid="trade-orderform-buy-tab"]')
+            return True
+        current_real_price = get_real_buy_price(page)
+        if current_real_price != last_order_price:
+            print(f"Check {check_count+1}: Price changed from {last_order_price} to {current_real_price}. Cancelling BUY order.")
+            cancel_order(page)
+            click_element(page, '[data-testid="trade-orderform-buy-tab"]')
+            return False
+        else:
+            print(f"Check {check_count+1}: Real BUY price unchanged at {current_real_price}.")
+        check_count += 1
+
+    print("After 3 checks, active BUY order still exists. Cancelling and recreating order.")
+    cancel_order(page)
+    click_element(page, '[data-testid="trade-orderform-buy-tab"]')
+    return False
+
+def trade_limit_sell_sol(page):
+    """
+    Place a limit SELL order by computing the target as (buy price + random increment).
+    BEFORE entering the order, click the SELL tab.
+    After submission, perform up to 3 checks (5 sec each).
+    In each check, recompute the target SELL price using the current buy price.
+    If it differs from the order price placed (last_order_price), cancel the order and return False;
+    otherwise, leave the order active.
+    Finally, click the SELL tab.
+    """
+    print("=== Initiating Limit SELL Order ===")
+    click_element(page, '[data-testid="trade-orderform-sell-tab"]')
+    click_element(page, '[data-testid="trade-orderform-limit-tab"]')
+    click_element(page, '[data-testid="trade-orderform-sell-tab"]')  # Ensure sell form is active
+
+    target_sell_price = compute_target_sell_price(page)
+    if not target_sell_price:
+        print("Could not compute target SELL price; aborting order.")
+        return False
+    last_order_price = target_sell_price
+    print(f"Using target SELL price: {last_order_price}")
+
+    limit_price_input_selector = '[data-testid="trade-orderform-limit-price-input"]'
+    page.wait_for_selector(limit_price_input_selector)
+    move_mouse_to_element(page, limit_price_input_selector)
+    random_delay()
+    page.fill(limit_price_input_selector, last_order_price)
+    random_delay()
+
+    sol_balance, usdt_balance = get_balances(page)
+    print(f"Current balances - SOL: {sol_balance}, USDT: {usdt_balance}")
+
+    random_percent = random.uniform(0.60, 0.95)
+    trade_amount = round(sol_balance * random_percent, 3)
+    print(f"Selling {trade_amount} SOL for SELL order (percent: {random_percent:.2f}).")
+
     size_input_selector = '[data-testid="trade-orderform-size-input"]'
     page.wait_for_selector(size_input_selector)
     move_mouse_to_element(page, size_input_selector)
@@ -106,47 +265,42 @@ def trade_sell_sol(page):
     page.fill(size_input_selector, str(trade_amount))
     random_delay()
 
-    # Click the Sell tab
-    sell_tab_selector = '[data-testid="trade-orderform-sell-tab"]'
-    click_element(page, sell_tab_selector)
+    # Recompute target SELL price before submission
+    new_target = compute_target_sell_price(page)
+    if new_target and new_target != last_order_price:
+        print(f"Computed target SELL price changed from {last_order_price} to {new_target} before submission. Updating.")
+        page.fill(limit_price_input_selector, new_target)
+        last_order_price = new_target
+        random_delay()
 
-    # Click the Sell submit button
-    sell_button_selector = '[data-testid="trade-orderform-submit-button"]'
-    click_element(page, sell_button_selector)
+    click_element(page, '[data-testid="trade-orderform-submit-button"]')
 
-def trade_buy_sol(page):
-    """
-    Buy SOL using the entire USDT balance (rounded to 3 decimals).
-    Fills `data-testid="trade-orderform-notional-input"`.
-    Then clicks the Buy tab and Buy button.
-    """
-    sol_balance, usdt_balance = get_balances(page)
-    print(f"Detected balances: SOL={sol_balance}, USDT={usdt_balance}")
+    # Perform up to 3 checks (5 sec each)
+    check_count = 0
+    while check_count < 3:
+        time.sleep(5)
+        order_present = safe_query_selector(page, ORDER_SELECTOR)
+        if not order_present:
+            print("SELL order filled; no active order found.")
+            click_element(page, '[data-testid="trade-orderform-sell-tab"]')
+            return True
+        new_target = compute_target_sell_price(page)
+        if new_target != last_order_price:
+            print(f"Check {check_count+1}: Computed target SELL price changed from {last_order_price} to {new_target}. Cancelling SELL order.")
+            cancel_order(page)
+            click_element(page, '[data-testid="trade-orderform-sell-tab"]')
+            return False
+        else:
+            print(f"Check {check_count+1}: Computed target SELL price unchanged at {new_target}.")
+        check_count += 1
 
-    trade_amount = round(usdt_balance, 3)
-    print(f"Buying SOL with {trade_amount} USDT")
-
-    # Fill the notional input (for USDT)
-    notional_input_selector = '[data-testid="trade-orderform-notional-input"]'
-    page.wait_for_selector(notional_input_selector)
-    move_mouse_to_element(page, notional_input_selector)
-    random_delay()
-    buy_tab_selector = '[data-testid="trade-orderform-buy-tab"]'
-    click_element(page, buy_tab_selector)
-    random_delay()
-    page.fill(notional_input_selector, str(trade_amount))
-    random_delay()
-
-    # Click the Buy tab
-
-    # Click the Buy submit button
-    buy_button_selector = '[data-testid="trade-orderform-submit-button"]'
-    click_element(page, buy_button_selector)
+    print("After 3 checks, active SELL order still exists. Cancelling and recreating order.")
+    cancel_order(page)
+    click_element(page, '[data-testid="trade-orderform-sell-tab"]')
+    return False
 
 def add_initial_cookies(context):
-    """Parse the provided cookie string and add initial cookies to the browser context."""
     cookie_string = (
-  
     )
     cookies = []
     for part in cookie_string.split(";"):
@@ -159,10 +313,10 @@ def add_initial_cookies(context):
                 "domain": "arkm.com",
                 "path": "/"
             })
-    context.add_cookies(cookies)
+    if cookies:
+        context.add_cookies(cookies)
 
 def save_cookies_to_file(context):
-    """Save cookies from the context to a file."""
     cookies = context.cookies()
     with open(COOKIE_FILE, "w") as f:
         for cookie in cookies:
@@ -171,52 +325,34 @@ def save_cookies_to_file(context):
 
 def main():
     with sync_playwright() as p:
-        # Launch Chromium with a proxy and a "normal" user agent
-        # (You can randomize or choose a specific one.)
         user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36"
         )
         print("Using user agent:", user_agent)
-
         browser = p.chromium.launch(
             headless=False,
-            proxy={
-                "server": PROXY_SERVER,
-                "username": PROXY_USERNAME,
-                "password": PROXY_PASSWORD,
-            }
+            proxy={"server": PROXY_SERVER,
+                   "username": PROXY_USERNAME,
+                   "password": PROXY_PASSWORD}
         )
-
-        # Create a new browser context with the user agent
         context = browser.new_context(user_agent=user_agent)
-
-        # Inject anti-detection + sessionStorage + IndexedDB overrides
         context.add_init_script("""
-            // Basic anti-detection
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-            Object.defineProperty(navigator, 'appVersion', {
-                get: () => '5.0 (Windows NT 10.0; Win64; x64)'
-            });
+            Object.defineProperty(navigator, 'appVersion', { get: () => '5.0 (Windows NT 10.0; Win64; x64)' });
             window.chrome = { runtime: {} };
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-
-            // Set sessionStorage item
             sessionStorage.setItem('metamaskConfig', JSON.stringify({
                 hideProvidersArray: false,
                 showMetamaskExplainer: false,
                 dontOverrideWindowEthereum: false
             }));
-
-            // Set IndexedDB value
             const dbName = "WALLET_CONNECT_V2_INDEXED_DB";
             const storeName = "keyvaluepairs";
             const key = "wc@2:core:0.3:keychain";
-            const value = JSON.stringify({
-               
-            });
+            const value = JSON.stringify({});
             const openRequest = indexedDB.open(dbName);
             openRequest.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -233,11 +369,8 @@ def main():
                 tx.oncomplete = () => { db.close(); };
             };
         """)
-
-        # Add initial cookies
         add_initial_cookies(context)
 
-        # Create page and navigate
         page = context.new_page()
         page.goto("https://arkm.com/trade/SOL_USDT")
         page.wait_for_load_state("networkidle")
@@ -245,23 +378,51 @@ def main():
         save_cookies_to_file(context)
 
         print("Starting trade loop. Press Ctrl+C to stop.")
+        transaction_type = 'buy'
+        active_order_count = 0
         try:
             while True:
-                # SELL SOL
-                click_element(page, '[data-testid="trade-orderform-market-tab"]')
-                page.wait_for_load_state("networkidle")
-                random_delay()
-                trade_sell_sol(page)
+                try:
+                    active_order = safe_query_selector(page, ORDER_SELECTOR)
+                except Exception as e:
+                    print("Error checking active order:", e)
+                    active_order = None
 
-                # BUY SOL
-                random_delay()
-                trade_buy_sol(page)
+                if active_order:
+                    active_order_count += 1
+                    print(f"Active order exists. Count: {active_order_count}. Waiting for resolution before starting a new trade.")
+                    if active_order_count >= 3:
+                        print("Active order detected 3 times consecutively. Cancelling active order.")
+                        cancel_order(page)
+                        active_order_count = 0
+                    time.sleep(10)
+                    continue
+                else:
+                    active_order_count = 0
 
-                # Wait a bit before repeating
-                random_delay()
+                if transaction_type == 'buy':
+                    print("\nAttempting LIMIT BUY order...")
+                    success = trade_limit_buy_sol(page)
+                    if success:
+                        active_order = safe_query_selector(page, ORDER_SELECTOR)
+                        if not active_order:
+                            transaction_type = 'sell'
+                    else:
+                        print("BUY order not executed. Retrying BUY order...")
+                else:
+                    print("\nAttempting LIMIT SELL order...")
+                    success = trade_limit_sell_sol(page)
+                    if success:
+                        active_order = safe_query_selector(page, ORDER_SELECTOR)
+                        if not active_order:
+                            transaction_type = 'buy'
+                    else:
+                        print("SELL order not executed. Retrying SELL order...")
+                random_delay(2, 5)
         except KeyboardInterrupt:
             print("Exiting trade loop...")
             browser.close()
 
 if __name__ == "__main__":
     main()
+
