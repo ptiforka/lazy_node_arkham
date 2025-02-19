@@ -406,7 +406,7 @@ def run_trading_loop():
             "(KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36"
         )
         print("Using user agent:", user_agent)
-        launch_args = {"headless": False}
+        launch_args = {"headless": True}
         if proxy_config:
             launch_args["proxy"] = proxy_config
             print("Using proxy:", proxy_config)
