@@ -137,7 +137,7 @@ def safe_query_selector(page, selector):
 def get_real_buy_price(page):
     """
     Fetch the real BUY price from the button with classes:
-    "pl-3 text-green-900 undefined"
+    "div.text-green-900 button, button.text-green-900"
     """
     try:
         buy_selector = "div.text-green-900 button, button.text-green-900"
@@ -397,7 +397,8 @@ def save_cookies_to_file(context):
             f.write(f"{cookie['name']}={cookie['value']}\n")
     print("Cookies saved to", COOKIE_FILE)
 
-def main():
+def run_trading_loop():
+    """Launches the browser, navigates to the trading page, and runs the trade loop."""
     proxy_config = load_proxy()  # This returns None if no proxy is set.
     with sync_playwright() as p:
         user_agent = (
@@ -410,7 +411,7 @@ def main():
             launch_args["proxy"] = proxy_config
             print("Using proxy:", proxy_config)
         browser = p.chromium.launch(**launch_args)
-        # Added ignoreHTTPSErrors=True to help bypass HTTPS issues via proxy
+        # ignore HTTPS errors to help bypass potential issues via proxy
         context = browser.new_context(user_agent=user_agent, ignore_https_errors=True)
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -458,10 +459,11 @@ def main():
             page.goto(url, wait_until="networkidle", timeout=60000)
         except Exception as e:
             print(f"Error navigating to {url}: {e}")
-            # Depending on your needs, you might choose to retry or exit here.
-            browser.close()
+            try:
+                browser.close()
+            except Exception as close_e:
+                print("Error closing browser:", close_e)
             return
-
         page.wait_for_load_state("networkidle")
         time.sleep(3)
         save_cookies_to_file(context)
@@ -469,49 +471,59 @@ def main():
         print("Starting trade loop. Press Ctrl+C to stop.")
         transaction_type = 'buy'
         active_order_count = 0
-        try:
-            while True:
-                try:
-                    active_order = safe_query_selector(page, ORDER_SELECTOR)
-                except Exception as e:
-                    print("Error checking active order:", e)
-                    active_order = None
+        while True:
+            try:
+                active_order = safe_query_selector(page, ORDER_SELECTOR)
+            except Exception as e:
+                print("Error checking active order:", e)
+                active_order = None
 
-                if active_order:
-                    active_order_count += 1
-                    print(f"Active order exists. Count: {active_order_count}. Waiting for resolution before starting a new trade.")
-                    if active_order_count >= 3:
-                        print("Active order detected 3 times consecutively. Cancelling active order.")
-                        cancel_order(page)
-                        active_order_count = 0
-                    time.sleep(10 * SPEED_FACTOR)
-                    continue
-                else:
+            if active_order:
+                active_order_count += 1
+                print(f"Active order exists. Count: {active_order_count}. Waiting for resolution before starting a new trade.")
+                if active_order_count >= 3:
+                    print("Active order detected 3 times consecutively. Cancelling active order.")
+                    cancel_order(page)
                     active_order_count = 0
+                time.sleep(10 * SPEED_FACTOR)
+                continue
+            else:
+                active_order_count = 0
 
-                if transaction_type == 'buy':
-                    print("\nAttempting LIMIT BUY order...")
-                    success = trade_limit_buy_asset(page)
-                    if success:
-                        active_order = safe_query_selector(page, ORDER_SELECTOR)
-                        if not active_order:
-                            transaction_type = 'sell'
-                    else:
-                        print("BUY order not executed. Retrying BUY order...")
+            if transaction_type == 'buy':
+                print("\nAttempting LIMIT BUY order...")
+                success = trade_limit_buy_asset(page)
+                if success:
+                    if not safe_query_selector(page, ORDER_SELECTOR):
+                        transaction_type = 'sell'
                 else:
-                    print("\nAttempting LIMIT SELL order...")
-                    success = trade_limit_sell_asset(page)
-                    if success:
-                        active_order = safe_query_selector(page, ORDER_SELECTOR)
-                        if not active_order:
-                            transaction_type = 'buy'
-                    else:
-                        print("SELL order not executed. Retrying SELL order...")
-                # Minimal delay between transactions to reduce slippage
-                random_delay(0.1, 0.3)
+                    print("BUY order not executed. Retrying BUY order...")
+            else:
+                print("\nAttempting LIMIT SELL order...")
+                success = trade_limit_sell_asset(page)
+                if success:
+                    if not safe_query_selector(page, ORDER_SELECTOR):
+                        transaction_type = 'buy'
+                else:
+                    print("SELL order not executed. Retrying SELL order...")
+            # Minimal delay between transactions to reduce slippage
+            random_delay(0.1, 0.3)
+    try:
+        browser.close()
+    except Exception as close_err:
+        print("Error closing browser:", close_err)
+
+def main():
+    while True:
+        try:
+            run_trading_loop()
         except KeyboardInterrupt:
             print("Exiting trade loop...")
-            browser.close()
+            break
+        except Exception as e:
+            print("Exception occurred in trading loop:", e)
+            print("Restarting browser and trading loop in 5 seconds...")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
