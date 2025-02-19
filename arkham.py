@@ -410,7 +410,8 @@ def main():
             launch_args["proxy"] = proxy_config
             print("Using proxy:", proxy_config)
         browser = p.chromium.launch(**launch_args)
-        context = browser.new_context(user_agent=user_agent)
+        # Added ignoreHTTPSErrors=True to help bypass HTTPS issues via proxy
+        context = browser.new_context(user_agent=user_agent, ignore_https_errors=True)
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
@@ -452,7 +453,15 @@ def main():
         # Use TRADE_ASSET in the URL
         page = context.new_page()
         trade_pair = f"{TRADE_ASSET}_USDT"
-        page.goto(f"https://arkm.com/trade/{trade_pair}")
+        url = f"https://arkm.com/trade/{trade_pair}"
+        try:
+            page.goto(url, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            print(f"Error navigating to {url}: {e}")
+            # Depending on your needs, you might choose to retry or exit here.
+            browser.close()
+            return
+
         page.wait_for_load_state("networkidle")
         time.sleep(3)
         save_cookies_to_file(context)
